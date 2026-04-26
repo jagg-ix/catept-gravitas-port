@@ -1,0 +1,10 @@
+.lake/
+build/
+.lean/
+*.olean
+*.ilean
+*.trace
+*.hash
+.recovery/
+lake-manifest.json
+.DS_Store
