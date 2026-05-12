@@ -64,124 +64,181 @@ def q (num den : Int) : Expr := .div (.lit (num : Rat)) (.lit (den : Rat))
 -- Basic simplification
 -- ---------------------------------------------------------------------------
 
+/-- Structural size of an `Expr`, used to bound the fuel passed to
+`simplifyN` / `symDiffN`.  Each constructor contributes at least 1; the
+`.diff` formal-derivative constructor contributes its subterm's size plus
+a small constant so that the recursive
+`simplify (.diff a x) = simplify (symDiff a x)` step has enough budget. -/
+def Expr.size : Expr → Nat
+  | .lit _      => 1
+  | .var _      => 1
+  | .neg a      => a.size + 1
+  | .add a b    => a.size + b.size + 1
+  | .sub a b    => a.size + b.size + 1
+  | .mul a b    => a.size + b.size + 1
+  | .div a b    => a.size + b.size + 1
+  | .pow a b    => a.size + b.size + 1
+  | .sin a      => a.size + 1
+  | .cos a      => a.size + 1
+  | .sqrt a     => a.size + 1
+  | .log a      => a.size + 1
+  | .exp a      => a.size + 1
+  | .diff a _   => 2 * a.size + 4
+
+/-- Fuel computed from an `Expr` for the top-level `simplify` wrapper.
+We use a generous bound so that even repeated symbolic-derivative chains
+within a single call terminate; for the canonical GR-tensor inputs the
+budget is comfortably sufficient. -/
+def Expr.simplifyFuel (e : Expr) : Nat := e.size * 4 + 64
+
 mutual
 
-/-- Structural simplification: collapses obvious algebraic identities.
-    Not a complete CAS but sufficient for the GR tensor computations. -/
-partial def simplify (e : Expr) : Expr :=
-  match e with
-  -- .neg: simplify argument first, then apply neg-elim rules
-  | .neg a            =>
-      match simplify a with
-      | .lit 0     => .lit 0
-      | .neg inner => inner               -- double-neg elimination
-      | a'         => .neg a'
-  | .add a (.lit 0)   => simplify a
-  | .add (.lit 0) b   => simplify b
-  | .add (.lit a) (.lit b) => .lit (a + b)
-  -- AFP tier-A: canonical form for neg-in-add
-  | .add (.neg a) b   =>
-      let a' := simplify a; let b' := simplify b
-      if a' == b' then .lit 0 else .sub b' a'
-  | .add a (.neg b)   =>
-      let a' := simplify a; let b' := simplify b
-      if a' == b' then .lit 0 else .sub a' b'
-  | .add a b          =>
-      let a' := simplify a; let b' := simplify b
-      if a' == .lit 0 then b'
-      else if b' == .lit 0 then a'
-      else .add a' b'
-  | .sub a (.lit 0)   => simplify a
-  | .sub (.lit 0) b   => simplify (.neg b)
-  | .sub (.lit a) (.lit b) => .lit (a - b)
-  | .sub a b          =>
-      let a' := simplify a; let b' := simplify b
-      if a' == b' then .lit 0
-      else .sub a' b'
-  | .mul (.lit 0) _   => .lit 0
-  | .mul _ (.lit 0)   => .lit 0
-  | .mul (.lit 1) b   => simplify b
-  | .mul a (.lit 1)   => simplify a
-  | .mul (.lit (-1)) b => simplify (.neg b)
-  | .mul a (.lit (-1)) => simplify (.neg a)
-  | .mul (.lit a) (.lit b) => .lit (a * b)
-  -- AFP: push neg outward for cleaner canonical form
-  | .mul (.neg a) (.neg b) => simplify (.mul a b)
-  | .mul (.neg a) b   =>
-      let a' := simplify a; let b' := simplify b
-      simplify (.neg (.mul a' b'))
-  | .mul a (.neg b)   =>
-      let a' := simplify a; let b' := simplify b
-      simplify (.neg (.mul a' b'))
-  | .mul a b          =>
-      let a' := simplify a; let b' := simplify b
-      if a' == .lit 0 || b' == .lit 0 then .lit 0
-      else if a' == .lit 1 then b'
-      else if b' == .lit 1 then a'
-      else .mul a' b'
-  | .div a (.lit 1)   => simplify a
-  | .div (.lit 0) _   => .lit 0
-  | .div (.lit a) (.lit b) =>
-      if b == 0 then .div (.lit a) (.lit b)
-      else .lit (a / b)
-  -- AFP: push neg outward through division
-  | .div (.neg a) (.neg b) => simplify (.div a b)
-  | .div (.neg a) b   => simplify (.neg (.div a b))
-  | .div a (.neg b)   => simplify (.neg (.div a b))
-  | .div a b          => .div (simplify a) (simplify b)
-  | .pow _ (.lit 0)   => .lit 1
-  | .pow a (.lit 1)   => simplify a
-  | .pow (.lit 0) _   => .lit 0
-  | .pow (.lit 1) _   => .lit 1
-  | .pow (.lit a) (.lit b) =>
-      -- only simplify when exponent is a non-negative integer
-      if b.den == 1 && b.num ≥ 0 then
-        .lit (a ^ b.num.toNat)
-      else .pow (.lit a) (.lit b)
-  | .pow a b          => .pow (simplify a) (simplify b)
-  | .sin (.lit 0)     => .lit 0
-  | .cos (.lit 0)     => .lit 1
-  | .sin a            => .sin (simplify a)
-  | .cos a            => .cos (simplify a)
-  | .sqrt (.lit 0)    => .lit 0
-  | .sqrt (.lit 1)    => .lit 1
-  | .sqrt a           => .sqrt (simplify a)
-  | .log (.lit 1)     => .lit 0
-  | .log a            => .log (simplify a)
-  | .exp (.lit 0)     => .lit 1
-  | .exp a            => .exp (simplify a)
-  | .diff a x         => simplify (symDiff a x)
-  | e                 => e
+/-- Fuel-bounded structural simplifier.  Total, kernel-reducible: structurally
+recursive on `n : Nat`.  Returns the input unchanged when fuel is exhausted.
+This is the kernel-reducible engine behind `Gravitas.simplify`. -/
+def simplifyN : Nat → Expr → Expr
+  | 0,     e => e
+  | n+1,   e =>
+    match e with
+    -- .neg: simplify argument first, then apply neg-elim rules
+    | .neg a            =>
+        match simplifyN n a with
+        | .lit 0     => .lit 0
+        | .neg inner => inner               -- double-neg elimination
+        | a'         => .neg a'
+    | .add a (.lit 0)   => simplifyN n a
+    | .add (.lit 0) b   => simplifyN n b
+    | .add (.lit a) (.lit b) => .lit (a + b)
+    -- AFP tier-A: canonical form for neg-in-add
+    | .add (.neg a) b   =>
+        let a' := simplifyN n a; let b' := simplifyN n b
+        if a' == b' then .lit 0 else .sub b' a'
+    | .add a (.neg b)   =>
+        let a' := simplifyN n a; let b' := simplifyN n b
+        if a' == b' then .lit 0 else .sub a' b'
+    | .add a b          =>
+        let a' := simplifyN n a; let b' := simplifyN n b
+        if a' == .lit 0 then b'
+        else if b' == .lit 0 then a'
+        else .add a' b'
+    | .sub a (.lit 0)   => simplifyN n a
+    | .sub (.lit 0) b   => simplifyN n (.neg b)
+    | .sub (.lit a) (.lit b) => .lit (a - b)
+    | .sub a b          =>
+        let a' := simplifyN n a; let b' := simplifyN n b
+        if a' == b' then .lit 0
+        else .sub a' b'
+    | .mul (.lit 0) _   => .lit 0
+    | .mul _ (.lit 0)   => .lit 0
+    | .mul (.lit 1) b   => simplifyN n b
+    | .mul a (.lit 1)   => simplifyN n a
+    | .mul (.lit (-1)) b => simplifyN n (.neg b)
+    | .mul a (.lit (-1)) => simplifyN n (.neg a)
+    | .mul (.lit a) (.lit b) => .lit (a * b)
+    -- AFP: push neg outward for cleaner canonical form
+    | .mul (.neg a) (.neg b) => simplifyN n (.mul a b)
+    | .mul (.neg a) b   =>
+        let a' := simplifyN n a; let b' := simplifyN n b
+        simplifyN n (.neg (.mul a' b'))
+    | .mul a (.neg b)   =>
+        let a' := simplifyN n a; let b' := simplifyN n b
+        simplifyN n (.neg (.mul a' b'))
+    | .mul a b          =>
+        let a' := simplifyN n a; let b' := simplifyN n b
+        if a' == .lit 0 || b' == .lit 0 then .lit 0
+        else if a' == .lit 1 then b'
+        else if b' == .lit 1 then a'
+        else .mul a' b'
+    | .div a (.lit 1)   => simplifyN n a
+    | .div (.lit 0) _   => .lit 0
+    | .div (.lit a) (.lit b) =>
+        if b == 0 then .div (.lit a) (.lit b)
+        else .lit (a / b)
+    -- AFP: push neg outward through division
+    | .div (.neg a) (.neg b) => simplifyN n (.div a b)
+    | .div (.neg a) b   => simplifyN n (.neg (.div a b))
+    | .div a (.neg b)   => simplifyN n (.neg (.div a b))
+    | .div a b          => .div (simplifyN n a) (simplifyN n b)
+    | .pow _ (.lit 0)   => .lit 1
+    | .pow a (.lit 1)   => simplifyN n a
+    | .pow (.lit 0) _   => .lit 0
+    | .pow (.lit 1) _   => .lit 1
+    | .pow (.lit a) (.lit b) =>
+        -- only simplify when exponent is a non-negative integer
+        if b.den == 1 && b.num ≥ 0 then
+          .lit (a ^ b.num.toNat)
+        else .pow (.lit a) (.lit b)
+    | .pow a b          => .pow (simplifyN n a) (simplifyN n b)
+    | .sin (.lit 0)     => .lit 0
+    | .cos (.lit 0)     => .lit 1
+    | .sin a            => .sin (simplifyN n a)
+    | .cos a            => .cos (simplifyN n a)
+    | .sqrt (.lit 0)    => .lit 0
+    | .sqrt (.lit 1)    => .lit 1
+    | .sqrt a           => .sqrt (simplifyN n a)
+    | .log (.lit 1)     => .lit 0
+    | .log a            => .log (simplifyN n a)
+    | .exp (.lit 0)     => .lit 1
+    | .exp a            => .exp (simplifyN n a)
+    | .diff a x         => simplifyN n (symDiffN n a x)
+    | e                 => e
 
-/-- Symbolic differentiation: ∂e/∂x, with immediate simplification. -/
-partial def symDiff (e : Expr) (x : String) : Expr :=
-  simplify <| match e with
-  | .lit _         => .lit 0
-  | .var y         => if y == x then .lit 1 else .lit 0
-  | .neg a         => .neg (symDiff a x)
-  | .add a b       => .add (symDiff a x) (symDiff b x)
-  | .sub a b       => .sub (symDiff a x) (symDiff b x)
-  | .mul a b       => .add (.mul (symDiff a x) b) (.mul a (symDiff b x))
-  | .div a b       => .div (.sub (.mul (symDiff a x) b) (.mul a (symDiff b x)))
-                           (.mul b b)
-  | .pow a (.lit n) =>
-      .mul (.mul (.lit n) (.pow a (.lit (n - 1)))) (symDiff a x)
-  | .pow a b       =>
-      -- d/dx [a^b] = a^b * (b' ln a + b a'/a)
-      .mul (.pow a b)
-           (.add (.mul (symDiff b x) (.log a))
-                 (.mul b (.div (symDiff a x) a)))
-  | .sin a         => .mul (.cos a) (symDiff a x)
-  | .cos a         => .mul (.neg (.sin a)) (symDiff a x)
-  | .sqrt a        => .div (symDiff a x) (.mul (.lit 2) (.sqrt a))
-  | .log a         => .div (symDiff a x) a
-  | .exp a         => .mul (.exp a) (symDiff a x)
-  | .diff e' y     =>
-      -- formal mixed partial: keep as nested diff
-      if x == y then .diff (symDiff e' x) x
-      else .diff (symDiff e' x) y
+/-- Fuel-bounded symbolic differentiation: ∂e/∂x with immediate simplification.
+Total, kernel-reducible: structurally recursive on `n : Nat`.  Returns the
+input unchanged when fuel is exhausted.  This is the kernel-reducible engine
+behind `Gravitas.symDiff`. -/
+def symDiffN : Nat → Expr → String → Expr
+  | 0,   e, _ => e
+  | n+1, e, x =>
+    simplifyN n <| match e with
+    | .lit _         => .lit 0
+    | .var y         => if y == x then .lit 1 else .lit 0
+    | .neg a         => .neg (symDiffN n a x)
+    | .add a b       => .add (symDiffN n a x) (symDiffN n b x)
+    | .sub a b       => .sub (symDiffN n a x) (symDiffN n b x)
+    | .mul a b       => .add (.mul (symDiffN n a x) b) (.mul a (symDiffN n b x))
+    | .div a b       => .div (.sub (.mul (symDiffN n a x) b) (.mul a (symDiffN n b x)))
+                             (.mul b b)
+    | .pow a (.lit k) =>
+        .mul (.mul (.lit k) (.pow a (.lit (k - 1)))) (symDiffN n a x)
+    | .pow a b       =>
+        -- d/dx [a^b] = a^b * (b' ln a + b a'/a)
+        .mul (.pow a b)
+             (.add (.mul (symDiffN n b x) (.log a))
+                   (.mul b (.div (symDiffN n a x) a)))
+    | .sin a         => .mul (.cos a) (symDiffN n a x)
+    | .cos a         => .mul (.neg (.sin a)) (symDiffN n a x)
+    | .sqrt a        => .div (symDiffN n a x) (.mul (.lit 2) (.sqrt a))
+    | .log a         => .div (symDiffN n a x) a
+    | .exp a         => .mul (.exp a) (symDiffN n a x)
+    | .diff e' y     =>
+        -- formal mixed partial: keep as nested diff
+        if x == y then .diff (symDiffN n e' x) x
+        else .diff (symDiffN n e' x) y
 
 end
+
+/-- Structural simplification: collapses obvious algebraic identities.
+    Not a complete CAS but sufficient for the GR tensor computations.
+
+    This is a total, kernel-reducible wrapper around `simplifyN` with an
+    automatically-computed fuel bound derived from the input's structural
+    size.  Replaces the previous `partial def simplify`; downstream call
+    sites are unchanged.
+
+    Note: this `def` is kernel-reducible.  Heavy `rfl`/`decide` proofs at
+    call sites that exercise deep symbolic reduction may need to bump
+    `set_option maxRecDepth` (e.g. `set_option maxRecDepth 4096`). -/
+def simplify (e : Expr) : Expr := simplifyN e.simplifyFuel e
+
+/-- Symbolic differentiation: ∂e/∂x, with immediate simplification.
+
+    Total, kernel-reducible wrapper around `symDiffN` with an
+    automatically-computed fuel bound.  Replaces the previous
+    `partial def symDiff`; downstream call sites are unchanged.
+
+    Note: kernel-reducible; cf. note on `simplify`. -/
+def symDiff (e : Expr) (x : String) : Expr := symDiffN e.simplifyFuel e x
 
 -- ---------------------------------------------------------------------------
 -- Matrix type and helpers
